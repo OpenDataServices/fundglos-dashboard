@@ -100,10 +100,17 @@ def load_and_process_data(json_list):
     
     # 🏛️ ORGANISATION EXTRACTION
     df['funder_name'] = safe_extract(df, 'funder.name')
-    df['funder_scheme'] = safe_extract(df, 'funder.identifier.scheme').fillna('Unknown') # NEW: Extract funder scheme
+    df['funder_scheme'] = safe_extract(df, 'funder.identifier.scheme').fillna('Unknown')
     df['recipient_name'] = safe_extract(df, 'recipient.name')
     
+    # 📋 PROGRAMME EXTRACTION
+    df['programme_id'] = safe_extract(df, 'programme.id')
     df['programme_title'] = safe_extract(df, 'programme.title').fillna('Unspecified Programme')
+    df['programme_description'] = safe_extract(df, 'programme.description')
+    df['programme_uri'] = safe_extract(df, 'programme.uri')
+    # Create a robust key for grouping (falls back to title if ID is missing)
+    df['programme_key'] = df['programme_id'].fillna(df['programme_title']).fillna('No Programme')
+    
     df['activity_title'] = safe_extract(df, 'activity.title').fillna('Unspecified Activity')
     
     if 'recipient.classifications' in df.columns:
@@ -194,7 +201,6 @@ def main():
 
     selected_types = st.sidebar.multiselect("Funding Type", options=df['type'].unique(), default=df['type'].unique())
     
-    # 🔑 NEW: Funder Identifier Scheme Filter
     selected_funder_schemes = st.sidebar.multiselect(
         "Funder ID Scheme", 
         options=sorted(df['funder_scheme'].dropna().unique()), 
@@ -229,8 +235,8 @@ def main():
     c4.metric("Unique Funders", f"{df_filtered['funder_name'].nunique():,}")
 
     # 📑 Analysis Tabs
-    tab_temporal, tab_financial, tab_funders, tab_recipients, tab_thematic, tab_geography, tab_dq = st.tabs([
-        "📅 Temporal", "💰 Financial", "🏛️ Funders", "🎁 Recipients", "🏷️ Thematic", "🗺️ Geography", "🔍 Data Quality"
+    tab_temporal, tab_financial, tab_programmes, tab_funders, tab_recipients, tab_thematic, tab_geography, tab_dq = st.tabs([
+        "📅 Temporal", "💰 Financial", "📜 Programmes", "🏛️ Funders", "🎁 Recipients", "🏷️ Thematic", "🗺️ Geography", "🔍 Data Quality"
     ])
 
     with tab_temporal:
@@ -276,6 +282,71 @@ def main():
             fig_type = px.box(df_pos, x='type', y='value_amount', color='type', labels={'value_amount': 'Award Amount (£)', 'type': 'Type'}, title='Award Size Distribution by Funding Type', color_discrete_map={'grant': '#19D3F3', 'procurement': '#FF4B4B'})
             fig_type.update_yaxes(type="log", title='Award Amount (£) [log scale]')
             st.plotly_chart(fig_type, use_container_width=True)
+
+    # 📜 PROGRAMMES TAB (NEW)
+    with tab_programmes:
+        st.subheader("📜 Programme Analysis")
+        st.caption("Analysis of funding programmes based on unique programme identifiers. Highlights collaborative programmes funded by multiple organizations.")
+        
+        # Group by programme key
+        prog_stats = df_filtered.groupby('programme_key').agg(
+            programme_id=('programme_id', 'first'),
+            title=('programme_title', 'first'),
+            uri=('programme_uri', 'first'),
+            total_opportunities=('id', 'count'),
+            total_value=('value_amount', 'sum'),
+            unique_funders=('funder_name', 'nunique'),
+            funders_list=('funder_name', lambda x: list(set(x.dropna())))
+        ).reset_index()
+        
+        # Filter out "No Programme" for headline stats
+        valid_progs = prog_stats[prog_stats['programme_key'] != 'No Programme']
+        
+        # Metrics
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total Unique Programmes", f"{len(valid_progs):,}")
+        c2.metric("Total Funding (Programmes)", f"£{valid_progs['total_value'].sum():,.0f}")
+        
+        multi_funder_progs = valid_progs[valid_progs['unique_funders'] > 1]
+        c3.metric("Shared Programmes (Multi-Funder)", f"{len(multi_funder_progs):,}")
+        
+        # Highlight Multi-Funder Programmes
+        if not multi_funder_progs.empty:
+            st.info("💡 **Shared Programmes:** The following programmes are delivered by multiple different funders.")
+            mf_display = multi_funder_progs[['title', 'total_opportunities', 'total_value', 'unique_funders', 'funders_list']].copy()
+            mf_display['funders_str'] = mf_display['funders_list'].apply(lambda x: ', '.join(x))
+            mf_display = mf_display.drop(columns=['funders_list']).rename(columns={
+                'title': 'Programme Title',
+                'total_opportunities': 'Opportunities',
+                'total_value': 'Total Value (£)',
+                'unique_funders': 'Funder Count',
+                'funders_str': 'Funders'
+            })
+            st.dataframe(
+                mf_display.style.format({'Total Value (£)': '£{:,.0f}'}),
+                use_container_width=True, hide_index=True
+            )
+            st.divider()
+
+        # Main Programme Table
+        st.write("### All Programmes Overview")
+        main_display = prog_stats[['programme_key', 'title', 'uri', 'total_opportunities', 'total_value', 'unique_funders']].copy()
+        main_display = main_display.rename(columns={
+            'programme_key': 'Programme Key',
+            'title': 'Programme Title',
+            'uri': 'URI',
+            'total_opportunities': 'Opportunities',
+            'total_value': 'Total Value (£)',
+            'unique_funders': 'Funder Count'
+        })
+        
+        st.dataframe(
+            main_display.style.format({'Total Value (£)': '£{:,.0f}'}),
+            use_container_width=True, hide_index=True,
+            column_config={
+                "URI": st.column_config.LinkColumn("URI")
+            }
+        )
 
     with tab_funders:
         st.subheader("🏛️ Funder Analysis")
@@ -612,10 +683,14 @@ def main():
     recs_with_class = df_filtered[df_filtered['recipient_classifications_raw'].apply(len) > 0]['recipient_name'].nunique()
     pct_recs_with_class = (recs_with_class / unique_recs * 100) if unique_recs > 0 else 0
     
+    # Calculate programme completeness
+    has_programme = (df_filtered['programme_key'] != 'No Programme').mean() * 100
+    
     st.caption("🔍 Data Quality: "
                f"Activity Geo {(df_filtered['act_loc_region'] != 'Unknown').mean()*100:.1f}% | "
                f"Recipient Geo {(df_filtered['rec_loc_region'] != 'Unknown').mean()*100:.1f}% | "
-               f"Recipients with Classifications: {pct_recs_with_class:.1f}%")
+               f"Recipients with Classifications: {pct_recs_with_class:.1f}% | "
+               f"Programmes: {has_programme:.1f}%")
 
 if __name__ == "__main__":
     main()
