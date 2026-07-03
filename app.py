@@ -108,7 +108,6 @@ def load_and_process_data(json_list):
     df['programme_title'] = safe_extract(df, 'programme.title').fillna('Unspecified Programme')
     df['programme_description'] = safe_extract(df, 'programme.description')
     df['programme_uri'] = safe_extract(df, 'programme.uri')
-    # Create a robust key for grouping (falls back to title if ID is missing)
     df['programme_key'] = df['programme_id'].fillna(df['programme_title']).fillna('No Programme')
     
     df['activity_title'] = safe_extract(df, 'activity.title').fillna('Unspecified Activity')
@@ -118,10 +117,29 @@ def load_and_process_data(json_list):
     else:
         df['recipient_classifications_raw'] = [[] for _ in range(len(df))]
         
+    # 🏷️ Extract NCVO Income Size classifications for filtering
+    def get_ncvo_values(class_list):
+        if not isinstance(class_list, list):
+            return []
+        values = []
+        for c in class_list:
+            if isinstance(c, dict) and c.get('scheme') == 'NCVO Income Size':
+                val = c.get('value')
+                if val is not None:
+                    values.append(str(val))
+        return values
+        
+    df['ncvo_income_values'] = df['recipient_classifications_raw'].apply(get_ncvo_values)
+    df['has_ncvo_income'] = df['ncvo_income_values'].apply(lambda x: len(x) > 0)
+        
     loc_mapping = {'country': 'ctrynm', 'region': 'rgnnm', 'utla': 'utlanm', 'lad': 'ladnm'}
     for lvl, suffix in loc_mapping.items():
         df[f'act_loc_{lvl}'] = safe_extract(df, f'activity.location.{suffix}').fillna('Unknown')
         df[f'rec_loc_{lvl}'] = safe_extract(df, f'recipient.location.{suffix}').fillna('Unknown')
+            
+    # 🔑 Extract UTLA Codes for Cross-Boundary Analysis
+    df['act_loc_utla_cd'] = safe_extract(df, 'activity.location.utlacd').fillna('Unknown')
+    df['rec_loc_utla_cd'] = safe_extract(df, 'recipient.location.utlacd').fillna('Unknown')
             
     df['type'] = safe_extract(df, 'type').fillna('Unknown')
     return df
@@ -210,6 +228,19 @@ def main():
     
     selected_funders = st.sidebar.multiselect("Funder", options=sorted(df['funder_name'].dropna().unique()), default=[])
     selected_currencies = st.sidebar.multiselect("Currency", options=df['value_currency'].unique(), default=[])
+    
+    # 🏷️ NEW: Recipient NCVO Income Size Filter
+    all_ncvo_values = set()
+    for val_list in df['ncvo_income_values']:
+        all_ncvo_values.update(val_list)
+    ncvo_options = ["(No NCVO Income Size Classification)"] + sorted(list(all_ncvo_values))
+    
+    selected_ncvo = st.sidebar.multiselect(
+        "Recipient NCVO Income Size",
+        options=ncvo_options,
+        default=[],
+        help="Filter by the recipient's NCVO Income Size classification. Select '(No NCVO Income Size Classification)' to find recipients missing this data."
+    )
 
     # 🔒 Apply Global Filters
     mask = (
@@ -219,6 +250,17 @@ def main():
     if selected_funder_schemes: mask &= df['funder_scheme'].isin(selected_funder_schemes)
     if selected_funders: mask &= df['funder_name'].isin(selected_funders)
     if selected_currencies: mask &= df['value_currency'].isin(selected_currencies)
+    
+    if selected_ncvo:
+        include_missing = "(No NCVO Income Size Classification)" in selected_ncvo
+        specific_values = set(v for v in selected_ncvo if v != "(No NCVO Income Size Classification)")
+        
+        ncvo_mask = pd.Series(False, index=df.index)
+        if include_missing:
+            ncvo_mask |= ~df['has_ncvo_income']
+        if specific_values:
+            ncvo_mask |= df['ncvo_income_values'].apply(lambda x: bool(set(x) & specific_values))
+        mask &= ncvo_mask
         
     df_filtered = df.loc[mask].copy()
 
@@ -283,12 +325,11 @@ def main():
             fig_type.update_yaxes(type="log", title='Award Amount (£) [log scale]')
             st.plotly_chart(fig_type, use_container_width=True)
 
-    # 📜 PROGRAMMES TAB (NEW)
+    # 📜 PROGRAMMES TAB
     with tab_programmes:
         st.subheader("📜 Programme Analysis")
         st.caption("Analysis of funding programmes based on unique programme identifiers. Highlights collaborative programmes funded by multiple organizations.")
         
-        # Group by programme key
         prog_stats = df_filtered.groupby('programme_key').agg(
             programme_id=('programme_id', 'first'),
             title=('programme_title', 'first'),
@@ -299,10 +340,8 @@ def main():
             funders_list=('funder_name', lambda x: list(set(x.dropna())))
         ).reset_index()
         
-        # Filter out "No Programme" for headline stats
         valid_progs = prog_stats[prog_stats['programme_key'] != 'No Programme']
         
-        # Metrics
         c1, c2, c3 = st.columns(3)
         c1.metric("Total Unique Programmes", f"{len(valid_progs):,}")
         c2.metric("Total Funding (Programmes)", f"£{valid_progs['total_value'].sum():,.0f}")
@@ -310,7 +349,6 @@ def main():
         multi_funder_progs = valid_progs[valid_progs['unique_funders'] > 1]
         c3.metric("Shared Programmes (Multi-Funder)", f"{len(multi_funder_progs):,}")
         
-        # Highlight Multi-Funder Programmes
         if not multi_funder_progs.empty:
             st.info("💡 **Shared Programmes:** The following programmes are delivered by multiple different funders.")
             mf_display = multi_funder_progs[['title', 'total_opportunities', 'total_value', 'unique_funders', 'funders_list']].copy()
@@ -328,7 +366,6 @@ def main():
             )
             st.divider()
 
-        # Main Programme Table
         st.write("### All Programmes Overview")
         main_display = prog_stats[['programme_key', 'title', 'uri', 'total_opportunities', 'total_value', 'unique_funders']].copy()
         main_display = main_display.rename(columns={
@@ -517,11 +554,67 @@ def main():
                 else: 
                     st.info("ℹ️ Ward-level latitude/longitude coordinates not present in this dataset.")
                         
+                # --- CROSS-BOUNDARY FUNDING ANALYSIS ---
+                st.write("### Cross-Boundary Funding (Activity vs Recipient UTLA Mismatch)")
+                st.caption("Funding where the recipient is based in a different Upper Tier Local Authority (UTLA) than where the activity takes place.")
+                
+                mismatch_mask = (
+                    (df_geo['act_loc_utla_cd'] != 'Unknown') & 
+                    (df_geo['rec_loc_utla_cd'] != 'Unknown') & 
+                    (df_geo['act_loc_utla_cd'] != df_geo['rec_loc_utla_cd'])
+                )
+                df_mismatch = df_geo[mismatch_mask].copy()
+                
+                if not df_mismatch.empty:
+                    c1, c2 = st.columns(2)
+                    c1.metric("Total Mismatched Opportunities", f"{len(df_mismatch):,}")
+                    c2.metric("Total Value (Cross-Boundary)", f"£{df_mismatch['value_amount'].sum():,.0f}")
+                    
+                    st.dataframe(
+                        df_mismatch[['id', 'value_amount', 'recipient_name', 'rec_loc_utla_cd', 'act_loc_utla_cd']].rename(columns={
+                            'id': 'Grant ID',
+                            'value_amount': 'Value (£)',
+                            'recipient_name': 'Recipient Organisation',
+                            'rec_loc_utla_cd': 'Recipient UTLA Code',
+                            'act_loc_utla_cd': 'Activity UTLA Code'
+                        }).style.format({'Value (£)': '£{:,.0f}'}),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                else:
+                    st.info("✅ No cross-boundary funding detected (all activities occur within the recipient's home UTLA, or location data is missing).")
+                # --- END CROSS-BOUNDARY ---
+                        
                 st.write("### Local Authority Districts")
-                lad_stats = df_geo[df_geo['act_loc_lad'] != 'Unknown'].groupby('act_loc_lad').size().reset_index(name='count')
-                if not lad_stats.empty: 
-                    st.dataframe(lad_stats.sort_values('count', ascending=False).head(15), use_container_width=True)
-                else: 
+                lad_df = df_geo[df_geo['act_loc_lad'] != 'Unknown'].copy()
+                if not lad_df.empty:
+                    lad_stats = lad_df.groupby('act_loc_lad').agg(
+                        opportunities=('id', 'count'),
+                        unique_funders=('funder_name', 'nunique'),
+                        total_funding=('value_amount', 'sum'),
+                        unique_recipients=('recipient_name', 'nunique')
+                    ).reset_index()
+                    
+                    lad_stats = lad_stats.sort_values('total_funding', ascending=False)
+                    
+                    st.dataframe(
+                        lad_stats.style.format({
+                            'total_funding': '£{:,.0f}',
+                            'opportunities': '{:,.0f}',
+                            'unique_funders': '{:,.0f}',
+                            'unique_recipients': '{:,.0f}'
+                        }),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "act_loc_lad": "Local Authority District",
+                            "opportunities": "Opportunities",
+                            "unique_funders": "Unique Funders",
+                            "total_funding": "Total Funding (£)",
+                            "unique_recipients": "Unique Recipients"
+                        }
+                    )
+                else:
                     st.caption("No district-level data available")
 
     # 🔍 DATA QUALITY TAB
@@ -682,8 +775,6 @@ def main():
     unique_recs = df_filtered['recipient_name'].nunique()
     recs_with_class = df_filtered[df_filtered['recipient_classifications_raw'].apply(len) > 0]['recipient_name'].nunique()
     pct_recs_with_class = (recs_with_class / unique_recs * 100) if unique_recs > 0 else 0
-    
-    # Calculate programme completeness
     has_programme = (df_filtered['programme_key'] != 'No Programme').mean() * 100
     
     st.caption("🔍 Data Quality: "
